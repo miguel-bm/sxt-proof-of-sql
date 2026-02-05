@@ -175,7 +175,10 @@ mod tests {
     use crate::{
         base::{
             commitment::InnerProductProof,
-            database::{owned_table_utility::*, OwnedTable, OwnedTableTestAccessor, TableRef},
+            database::{
+                owned_table_utility::*, ColumnField, ColumnType, OwnedTable,
+                OwnedTableTestAccessor, TableRef,
+            },
             scalar::test_scalar::TestScalar,
         },
         sql::{
@@ -197,14 +200,19 @@ mod tests {
     fn we_can_compute_abs_of_positive_values() {
         let data = owned_table([bigint("a", [1_i64, 2, 3, 4, 5])]);
         let t = TableRef::new("sxt", "t");
-        let accessor = OwnedTableTestAccessor::<InnerProductProof>::new_from_table(t, data, 0, ());
+        let accessor =
+            OwnedTableTestAccessor::<InnerProductProof>::new_from_table(t.clone(), data, 0, ());
+        let table_exec = table_exec(
+            t.clone(),
+            vec![ColumnField::new("a".into(), ColumnType::BigInt)],
+        );
         let expr = filter(
             vec![aliased_plan(abs(column(&t, "a", &accessor)), "abs_a")],
-            tab(&t),
+            table_exec,
             const_bool(true),
         );
-        let res = VerifiableQueryResult::new(&expr, &accessor, &(), &[]);
-        exercise_verification(&res, &expr, &accessor, &t, &());
+        let res = VerifiableQueryResult::new(&expr, &accessor, &(), &[]).unwrap();
+        exercise_verification(&res, &expr, &accessor, &t);
         let res = res.verify(&expr, &accessor, &(), &[]).unwrap().table;
         let expected = owned_table([bigint("abs_a", [1_i64, 2, 3, 4, 5])]);
         assert_eq!(res, expected);
@@ -214,14 +222,19 @@ mod tests {
     fn we_can_compute_abs_of_negative_values() {
         let data = owned_table([bigint("a", [-1_i64, -2, -3, -4, -5])]);
         let t = TableRef::new("sxt", "t");
-        let accessor = OwnedTableTestAccessor::<InnerProductProof>::new_from_table(t, data, 0, ());
+        let accessor =
+            OwnedTableTestAccessor::<InnerProductProof>::new_from_table(t.clone(), data, 0, ());
+        let table_exec = table_exec(
+            t.clone(),
+            vec![ColumnField::new("a".into(), ColumnType::BigInt)],
+        );
         let expr = filter(
             vec![aliased_plan(abs(column(&t, "a", &accessor)), "abs_a")],
-            tab(&t),
+            table_exec,
             const_bool(true),
         );
-        let res = VerifiableQueryResult::new(&expr, &accessor, &(), &[]);
-        exercise_verification(&res, &expr, &accessor, &t, &());
+        let res = VerifiableQueryResult::new(&expr, &accessor, &(), &[]).unwrap();
+        exercise_verification(&res, &expr, &accessor, &t);
         let res = res.verify(&expr, &accessor, &(), &[]).unwrap().table;
         let expected = owned_table([bigint("abs_a", [1_i64, 2, 3, 4, 5])]);
         assert_eq!(res, expected);
@@ -231,14 +244,19 @@ mod tests {
     fn we_can_compute_abs_of_zero() {
         let data = owned_table([bigint("a", [0_i64, 0, 0])]);
         let t = TableRef::new("sxt", "t");
-        let accessor = OwnedTableTestAccessor::<InnerProductProof>::new_from_table(t, data, 0, ());
+        let accessor =
+            OwnedTableTestAccessor::<InnerProductProof>::new_from_table(t.clone(), data, 0, ());
+        let table_exec = table_exec(
+            t.clone(),
+            vec![ColumnField::new("a".into(), ColumnType::BigInt)],
+        );
         let expr = filter(
             vec![aliased_plan(abs(column(&t, "a", &accessor)), "abs_a")],
-            tab(&t),
+            table_exec,
             const_bool(true),
         );
-        let res = VerifiableQueryResult::new(&expr, &accessor, &(), &[]);
-        exercise_verification(&res, &expr, &accessor, &t, &());
+        let res = VerifiableQueryResult::new(&expr, &accessor, &(), &[]).unwrap();
+        exercise_verification(&res, &expr, &accessor, &t);
         let res = res.verify(&expr, &accessor, &(), &[]).unwrap().table;
         let expected = owned_table([bigint("abs_a", [0_i64, 0, 0])]);
         assert_eq!(res, expected);
@@ -248,14 +266,23 @@ mod tests {
     fn we_can_compute_abs_of_mixed_values() {
         let data = create_test_table();
         let t = TableRef::new("sxt", "t");
-        let accessor = OwnedTableTestAccessor::<InnerProductProof>::new_from_table(t, data, 0, ());
+        let accessor =
+            OwnedTableTestAccessor::<InnerProductProof>::new_from_table(t.clone(), data, 0, ());
+        let table_exec = table_exec(
+            t.clone(),
+            vec![
+                ColumnField::new("a".into(), ColumnType::BigInt),
+                ColumnField::new("b".into(), ColumnType::SmallInt),
+                ColumnField::new("c".into(), ColumnType::Int),
+            ],
+        );
         let expr = filter(
             vec![aliased_plan(abs(column(&t, "a", &accessor)), "abs_a")],
-            tab(&t),
+            table_exec,
             const_bool(true),
         );
-        let res = VerifiableQueryResult::new(&expr, &accessor, &(), &[]);
-        exercise_verification(&res, &expr, &accessor, &t, &());
+        let res = VerifiableQueryResult::new(&expr, &accessor, &(), &[]).unwrap();
+        exercise_verification(&res, &expr, &accessor, &t);
         let res = res.verify(&expr, &accessor, &(), &[]).unwrap().table;
         let expected = owned_table([bigint("abs_a", [5_i64, 3, 0, 3, 5])]);
         assert_eq!(res, expected);
