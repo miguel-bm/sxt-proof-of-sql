@@ -98,7 +98,14 @@ impl ProofExpr for AbsExpr {
         // Compute abs: if sign is negative, negate the value
         let result = compute_abs(alloc, expr_scalars, signs);
 
-        // Produce intermediate MLE for the result
+        // Convert signs to scalars for use in the constraint
+        // The sign gadget proves the bit decomposition but doesn't commit to the sign array directly
+        let signs_scalar: &[S] =
+            alloc
+                .alloc_slice_fill_iter(signs.iter().map(|&b| if b { S::one() } else { S::zero() }));
+
+        // Produce intermediate MLEs in order: signs, then result
+        builder.produce_intermediate_mle(signs_scalar as &[_]);
         builder.produce_intermediate_mle(result as &[_]);
 
         // Prove the constraint: result = expr * (1 - 2*sign)
@@ -111,7 +118,10 @@ impl ProofExpr for AbsExpr {
                 (-S::one(), vec![Box::new(expr_scalars as &[_])]),
                 (
                     S::TWO,
-                    vec![Box::new(expr_scalars as &[_]), Box::new(signs as &[_])],
+                    vec![
+                        Box::new(expr_scalars as &[_]),
+                        Box::new(signs_scalar as &[_]),
+                    ],
                 ),
             ],
         );
@@ -134,12 +144,21 @@ impl ProofExpr for AbsExpr {
 
         // Get the sign evaluation from the sign gadget
         // verifier_evaluate_sign returns chi_eval - sign_eval when successful
-        // so sign_eval = chi_eval - (chi_eval - sign_eval)
         let chi_minus_sign_eval = verifier_evaluate_sign(builder, expr_eval, chi_eval, None)?;
-        let sign_eval = chi_eval - chi_minus_sign_eval;
+
+        // Consume the signs MLE evaluation (must match the sign gadget's evaluation)
+        let sign_eval = builder.try_consume_final_round_mle_evaluation()?;
 
         // Consume the result MLE evaluation
         let result_eval = builder.try_consume_final_round_mle_evaluation()?;
+
+        // Verify that the committed sign matches the sign gadget's computation
+        // chi_minus_sign_eval should equal chi_eval - sign_eval
+        if chi_minus_sign_eval != chi_eval - sign_eval {
+            return Err(ProofError::VerificationError {
+                error: "sign MLE does not match sign gadget",
+            });
+        }
 
         // Verify the constraint: result = expr * (1 - 2*sign)
         // which is: result - expr + 2*expr*sign = 0
