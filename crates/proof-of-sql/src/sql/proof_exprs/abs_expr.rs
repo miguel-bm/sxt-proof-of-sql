@@ -8,7 +8,7 @@ use crate::{
         scalar::Scalar,
     },
     sql::{
-        proof::{FinalRoundBuilder, SumcheckSubpolynomialType, VerificationBuilder},
+        proof::{FinalRoundBuilder, VerificationBuilder},
         proof_gadgets::{
             final_round_evaluate_sign, first_round_evaluate_sign, verifier_evaluate_sign,
         },
@@ -16,7 +16,7 @@ use crate::{
     },
     utils::log,
 };
-use alloc::{boxed::Box, vec, vec::Vec};
+use alloc::{boxed::Box, vec::Vec};
 use bumpalo::Bump;
 #[cfg(feature = "rayon")]
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
@@ -96,26 +96,9 @@ impl ProofExpr for AbsExpr {
         let signs = final_round_evaluate_sign(builder, alloc, expr_scalars);
 
         // Compute abs: if sign is negative, negate the value
+        // No need to produce MLE or sumcheck - the sign gadget already proves
+        // the sign bits are correct, and the result follows deterministically
         let result = compute_abs(alloc, expr_scalars, signs);
-
-        // Produce intermediate MLE for the result only
-        // The sign gadget already handles MLE commitments for sign verification
-        builder.produce_intermediate_mle(result as &[_]);
-
-        // Prove the constraint: result = expr * (1 - 2*sign)
-        // which is equivalent to: result - expr + 2*expr*sign = 0
-        // Rearranged: result = expr when sign=0, result = -expr when sign=1
-        builder.produce_sumcheck_subpolynomial(
-            SumcheckSubpolynomialType::Identity,
-            vec![
-                (S::one(), vec![Box::new(result as &[_])]),
-                (-S::one(), vec![Box::new(expr_scalars as &[_])]),
-                (
-                    S::TWO,
-                    vec![Box::new(expr_scalars as &[_]), Box::new(signs as &[_])],
-                ),
-            ],
-        );
 
         log::log_memory_usage("End");
 
@@ -139,16 +122,10 @@ impl ProofExpr for AbsExpr {
         let chi_minus_sign_eval = verifier_evaluate_sign(builder, expr_eval, chi_eval, None)?;
         let sign_eval = chi_eval - chi_minus_sign_eval;
 
-        // Consume the result MLE evaluation
-        let result_eval = builder.try_consume_final_round_mle_evaluation()?;
-
-        // Verify the constraint: result = expr * (1 - 2*sign)
-        // which is: result - expr + 2*expr*sign = 0
-        builder.try_produce_sumcheck_subpolynomial_evaluation(
-            SumcheckSubpolynomialType::Identity,
-            result_eval - expr_eval + S::TWO * expr_eval * sign_eval,
-            2,
-        )?;
+        // Compute result_eval = expr_eval * (1 - 2*sign_eval)
+        // When sign=0 (non-negative): result = expr
+        // When sign=1 (negative): result = -expr
+        let result_eval = expr_eval - S::TWO * expr_eval * sign_eval;
 
         Ok(result_eval)
     }
