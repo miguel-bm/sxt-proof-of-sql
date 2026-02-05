@@ -96,9 +96,11 @@ impl ProofExpr for AbsExpr {
         let signs = final_round_evaluate_sign(builder, alloc, expr_scalars);
 
         // Compute abs: if sign is negative, negate the value
-        // No need to produce MLE or sumcheck - the sign gadget already proves
-        // the sign bits are correct, and the result follows deterministically
         let result = compute_abs(alloc, expr_scalars, signs);
+
+        // Produce intermediate MLE for the result
+        // FilterExec needs this for column commitments
+        builder.produce_intermediate_mle(result as &[_]);
 
         log::log_memory_usage("End");
 
@@ -118,14 +120,11 @@ impl ProofExpr for AbsExpr {
 
         // Get the sign evaluation from the sign gadget
         // verifier_evaluate_sign returns chi_eval - sign_eval when successful
-        // so sign_eval = chi_eval - (chi_eval - sign_eval)
-        let chi_minus_sign_eval = verifier_evaluate_sign(builder, expr_eval, chi_eval, None)?;
-        let sign_eval = chi_eval - chi_minus_sign_eval;
+        // This consumes the sign gadget's MLEs and constraints
+        let _chi_minus_sign_eval = verifier_evaluate_sign(builder, expr_eval, chi_eval, None)?;
 
-        // Compute result_eval = expr_eval * (1 - 2*sign_eval)
-        // When sign=0 (non-negative): result = expr
-        // When sign=1 (negative): result = -expr
-        let result_eval = expr_eval - S::TWO * expr_eval * sign_eval;
+        // Consume the result MLE evaluation
+        let result_eval = builder.try_consume_final_round_mle_evaluation()?;
 
         Ok(result_eval)
     }
