@@ -137,6 +137,139 @@ fn alloc_signs<'a, S: Scalar>(alloc: &'a Bump, expr: &'a [S]) -> &'a [bool] {
     alloc.alloc_slice_copy(&signs)
 }
 
+/// Result of sign evaluation with an explicitly committed sign column.
+///
+/// This struct is returned by [`final_round_evaluate_sign_with_column`] and contains
+/// both the sign bits and a committed sign column suitable for use in sumcheck polynomials.
+pub struct SignResultWithColumn<'a, S: Scalar> {
+    /// The sign bits as booleans (true if negative)
+    pub signs: &'a [bool],
+    /// The sign column as scalars, committed as an intermediate MLE.
+    /// This can be used directly in sumcheck polynomial constraints.
+    pub sign_column: &'a [S],
+}
+
+/// Prove the sign decomposition for a column of scalars, with an explicitly committed sign column.
+///
+/// This is similar to [`final_round_evaluate_sign`], but additionally commits the sign column
+/// as a separate MLE that can be used in external sumcheck polynomial constraints.
+///
+/// Use this when you need to use the sign value in a computation (like ABS), not just
+/// as a direct result (like inequality comparison).
+///
+/// # Security
+/// The sign column is committed AFTER the bit decomposition MLEs. The verifier will
+/// consume both and can verify they represent the same sign values. This ensures
+/// a malicious prover cannot use arbitrary sign values in constraints.
+#[tracing::instrument(
+    name = "SignExpr::final_round_evaluate_sign_with_column",
+    level = "debug",
+    skip_all
+)]
+pub fn final_round_evaluate_sign_with_column<'a, S: Scalar>(
+    builder: &mut FinalRoundBuilder<'a, S>,
+    alloc: &'a Bump,
+    expr: &'a [S],
+) -> SignResultWithColumn<'a, S> {
+    let span = span!(Level::DEBUG, "produce_bit_distribution").entered();
+    // bit_distribution
+    let dist = BitDistribution::new::<S, _>(expr);
+    builder.produce_bit_distribution(dist.clone());
+    span.exit();
+
+    if dist.num_varying_bits() > 0 {
+        // prove that the bits are binary
+        let bits = compute_varying_bit_matrix(alloc, expr, &dist);
+        prove_bits_are_binary(builder, &bits);
+    }
+
+    let signs = alloc_signs(alloc, expr);
+
+    // Convert signs to scalars and commit as an intermediate MLE.
+    // This allows the sign to be used in external sumcheck polynomial constraints.
+    let sign_column: &[S] =
+        alloc.alloc_slice_fill_iter(signs.iter().map(|&b| if b { S::one() } else { S::zero() }));
+    builder.produce_intermediate_mle(sign_column);
+
+    SignResultWithColumn { signs, sign_column }
+}
+
+/// Verify the sign decomposition and return sign_eval for use in constraints.
+///
+/// This is similar to [`verifier_evaluate_sign`], but additionally consumes the
+/// committed sign column MLE and returns `sign_eval` directly for use in constraint
+/// verification.
+///
+/// # Returns
+/// Returns `sign_eval` (the evaluation of the sign bit MLE at the random point),
+/// which can be used directly in sumcheck polynomial constraint verification.
+///
+/// # Security
+/// This function verifies that the consumed sign column evaluation matches the
+/// sign derived from the bit decomposition. If they don't match, verification fails.
+pub fn verifier_evaluate_sign_with_column<S: Scalar>(
+    builder: &mut impl VerificationBuilder<S>,
+    eval: S,
+    chi_eval: S,
+    num_bits_allowed: Option<u8>,
+) -> Result<S, ProofError> {
+    // bit_distribution
+    let dist = builder.try_consume_bit_distribution()?;
+
+    // extract evaluations and commitments of the multilinear extensions for the varying
+    // bits of the expression
+    let mut rhs = S::ZERO;
+    let mut lead_bit = None;
+    for bit_index in dist.vary_mask_iter() {
+        let bit_eval = builder.try_consume_final_round_mle_evaluation()?;
+        builder.try_produce_sumcheck_subpolynomial_evaluation(
+            SumcheckSubpolynomialType::Identity,
+            bit_eval - bit_eval * bit_eval,
+            2,
+        )?;
+        if bit_index == 255 {
+            lead_bit = Some(bit_eval);
+        } else {
+            let mult = U256::ONE.shl(bit_index);
+            rhs += S::from_wrapping(mult) * bit_eval;
+        }
+    }
+
+    let sign_eval_from_bits = dist
+        .try_constant_leading_bit_eval(chi_eval)
+        .map_or_else(|| lead_bit.ok_or(BitDistributionError::NoLeadBit), Ok)?;
+    rhs += sign_eval_from_bits * S::from_wrapping(dist.leading_bit_mask())
+        + (chi_eval - sign_eval_from_bits) * S::from_wrapping(dist.leading_bit_inverse_mask())
+        - chi_eval * S::from_wrapping(U256::ONE.shl(255));
+    let num_bits_allowed = num_bits_allowed.unwrap_or(S::MAX_BITS);
+    if num_bits_allowed > S::MAX_BITS {
+        return Err(ProofError::from(BitDistributionError::Verification));
+    }
+    let bits_that_must_match_inverse_lead_bit =
+        U256::MAX.shl(num_bits_allowed - 1) ^ U256::ONE.shl(255);
+    let is_eval_correct_number_of_bits = bits_that_must_match_inverse_lead_bit
+        & dist.leading_bit_inverse_mask()
+        == bits_that_must_match_inverse_lead_bit;
+
+    if !(rhs == eval && is_eval_correct_number_of_bits) {
+        return Err(ProofError::from(BitDistributionError::Verification));
+    }
+
+    // Consume the committed sign column evaluation
+    let sign_column_eval = builder.try_consume_final_round_mle_evaluation()?;
+
+    // SECURITY: Verify the committed sign column matches the sign from bit decomposition.
+    // This prevents a malicious prover from committing arbitrary sign values.
+    if sign_column_eval != sign_eval_from_bits {
+        return Err(ProofError::VerificationError {
+            error: "sign column does not match sign from bit decomposition",
+        });
+    }
+
+    // Return sign_eval for use in external constraints
+    Ok(sign_column_eval)
+}
+
 fn prove_bits_are_binary<'a, S: Scalar>(
     builder: &mut FinalRoundBuilder<'a, S>,
     bits: &[&'a [bool]],

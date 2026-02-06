@@ -22,7 +22,8 @@ mod permutation_check_test;
 use shift::{final_round_evaluate_shift, first_round_evaluate_shift, verify_shift};
 mod sign_expr;
 pub(crate) use sign_expr::{
-    final_round_evaluate_sign, first_round_evaluate_sign, verifier_evaluate_sign,
+    final_round_evaluate_sign, final_round_evaluate_sign_with_column, first_round_evaluate_sign,
+    verifier_evaluate_sign, verifier_evaluate_sign_with_column, SignResultWithColumn,
 };
 #[cfg(feature = "blitzar")]
 #[cfg_attr(not(test), expect(dead_code))]
