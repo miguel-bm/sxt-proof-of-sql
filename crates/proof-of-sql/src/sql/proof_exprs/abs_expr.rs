@@ -93,10 +93,15 @@ impl ProofExpr for AbsExpr {
         let expr_scalars = alloc.alloc_slice_copy(&expr_column.to_scalar());
 
         // Get sign bits (true if negative) and produce the necessary proof components
-        // The sign gadget commits bit decomposition MLEs and proves they are binary
+        // The sign gadget commits bit decomposition MLEs and proves they are binary.
+        // IMPORTANT: We do NOT commit sign_scalars as a separate MLE.
+        // The verifier derives sign_eval from the sign gadget's committed bits:
+        //   sign_eval = chi_eval - chi_minus_sign_eval
+        // This ensures the sign used in our constraint is cryptographically linked
+        // to the sign gadget's verified output.
         let signs = final_round_evaluate_sign(builder, alloc, expr_scalars);
 
-        // Convert signs to scalars for use in the constraint
+        // Convert signs to scalars for use in the sumcheck polynomial
         let sign_scalars: &[S] =
             alloc
                 .alloc_slice_fill_iter(signs.iter().map(|&b| if b { S::one() } else { S::zero() }));
@@ -104,13 +109,15 @@ impl ProofExpr for AbsExpr {
         // Compute abs: if sign is negative, negate the value
         let result = compute_abs(alloc, expr_scalars, signs);
 
-        // Produce intermediate MLEs: sign_scalars first (to match verifier consumption order), then result
-        builder.produce_intermediate_mle(sign_scalars as &[_]);
+        // Commit only the result MLE
         builder.produce_intermediate_mle(result as &[_]);
 
         // Prove the constraint: result = expr * (1 - 2*sign)
         // Rearranged: result - expr + 2*expr*sign = 0
         // This ensures result = expr when sign=0, and result = -expr when sign=1
+        //
+        // Note: sign_scalars is NOT committed separately. The verifier computes
+        // sign_eval from the sign gadget's output, ensuring cryptographic linkage.
         builder.produce_sumcheck_subpolynomial(
             SumcheckSubpolynomialType::Identity,
             vec![
@@ -144,10 +151,13 @@ impl ProofExpr for AbsExpr {
 
         // Verify the sign gadget's bit decomposition constraints
         // This consumes the sign gadget's bit MLEs and verifies they are binary
-        let _chi_minus_sign_eval = verifier_evaluate_sign(builder, expr_eval, chi_eval, None)?;
+        let chi_minus_sign_eval = verifier_evaluate_sign(builder, expr_eval, chi_eval, None)?;
 
-        // Consume the sign MLE evaluation (we committed this for the constraint)
-        let sign_eval = builder.try_consume_final_round_mle_evaluation()?;
+        // SECURITY: Derive sign_eval from the sign gadget's verified output.
+        // This ensures the sign used in our constraint is cryptographically linked
+        // to the sign gadget's bit decomposition, preventing a malicious prover
+        // from using arbitrary sign values.
+        let sign_eval = chi_eval - chi_minus_sign_eval;
 
         // Consume the result MLE evaluation
         let result_eval = builder.try_consume_final_round_mle_evaluation()?;
@@ -291,5 +301,97 @@ mod tests {
 
         let varchar_expr = DynProofExpr::new_literal(LiteralValue::VarChar("test".to_string()));
         assert!(AbsExpr::try_new(Box::new(varchar_expr)).is_err());
+    }
+
+    #[test]
+    fn we_can_compute_abs_of_int128_values() {
+        let data = owned_table([int128("a", [-1_000_000_000_000_i128, 0, 1_000_000_000_000])]);
+        let t = TableRef::new("sxt", "t");
+        let accessor =
+            OwnedTableTestAccessor::<InnerProductProof>::new_from_table(t.clone(), data, 0, ());
+        let table_exec = table_exec(
+            t.clone(),
+            vec![ColumnField::new("a".into(), ColumnType::Int128)],
+        );
+        let expr = filter(
+            vec![aliased_plan(abs(column(&t, "a", &accessor)), "abs_a")],
+            table_exec,
+            const_bool(true),
+        );
+        let res = VerifiableQueryResult::new(&expr, &accessor, &(), &[]).unwrap();
+        exercise_verification(&res, &expr, &accessor, &t);
+        let res = res.verify(&expr, &accessor, &(), &[]).unwrap().table;
+        let expected = owned_table([int128("abs_a", [1_000_000_000_000_i128, 0, 1_000_000_000_000])]);
+        assert_eq!(res, expected);
+    }
+
+    #[test]
+    fn we_can_compute_abs_of_smallint_values() {
+        let data = owned_table([smallint("a", [-100_i16, -1, 0, 1, 100])]);
+        let t = TableRef::new("sxt", "t");
+        let accessor =
+            OwnedTableTestAccessor::<InnerProductProof>::new_from_table(t.clone(), data, 0, ());
+        let table_exec = table_exec(
+            t.clone(),
+            vec![ColumnField::new("a".into(), ColumnType::SmallInt)],
+        );
+        let expr = filter(
+            vec![aliased_plan(abs(column(&t, "a", &accessor)), "abs_a")],
+            table_exec,
+            const_bool(true),
+        );
+        let res = VerifiableQueryResult::new(&expr, &accessor, &(), &[]).unwrap();
+        exercise_verification(&res, &expr, &accessor, &t);
+        let res = res.verify(&expr, &accessor, &(), &[]).unwrap().table;
+        let expected = owned_table([smallint("abs_a", [100_i16, 1, 0, 1, 100])]);
+        assert_eq!(res, expected);
+    }
+
+    #[test]
+    fn we_can_compute_abs_of_large_negative_values() {
+        // Test with values close to the limits of the type
+        let data = owned_table([bigint("a", [i64::MIN + 1, i64::MAX, -i64::MAX])]);
+        let t = TableRef::new("sxt", "t");
+        let accessor =
+            OwnedTableTestAccessor::<InnerProductProof>::new_from_table(t.clone(), data, 0, ());
+        let table_exec = table_exec(
+            t.clone(),
+            vec![ColumnField::new("a".into(), ColumnType::BigInt)],
+        );
+        let expr = filter(
+            vec![aliased_plan(abs(column(&t, "a", &accessor)), "abs_a")],
+            table_exec,
+            const_bool(true),
+        );
+        let res = VerifiableQueryResult::new(&expr, &accessor, &(), &[]).unwrap();
+        exercise_verification(&res, &expr, &accessor, &t);
+        let res = res.verify(&expr, &accessor, &(), &[]).unwrap().table;
+        // i64::MIN + 1 = -9223372036854775807, abs = 9223372036854775807 = i64::MAX
+        // i64::MAX = 9223372036854775807, abs = 9223372036854775807
+        // -i64::MAX = -9223372036854775807, abs = 9223372036854775807
+        let expected = owned_table([bigint("abs_a", [i64::MAX, i64::MAX, i64::MAX])]);
+        assert_eq!(res, expected);
+    }
+
+    #[test]
+    fn we_can_compute_abs_with_single_row() {
+        let data = owned_table([bigint("a", [-42_i64])]);
+        let t = TableRef::new("sxt", "t");
+        let accessor =
+            OwnedTableTestAccessor::<InnerProductProof>::new_from_table(t.clone(), data, 0, ());
+        let table_exec = table_exec(
+            t.clone(),
+            vec![ColumnField::new("a".into(), ColumnType::BigInt)],
+        );
+        let expr = filter(
+            vec![aliased_plan(abs(column(&t, "a", &accessor)), "abs_a")],
+            table_exec,
+            const_bool(true),
+        );
+        let res = VerifiableQueryResult::new(&expr, &accessor, &(), &[]).unwrap();
+        exercise_verification(&res, &expr, &accessor, &t);
+        let res = res.verify(&expr, &accessor, &(), &[]).unwrap().table;
+        let expected = owned_table([bigint("abs_a", [42_i64])]);
+        assert_eq!(res, expected);
     }
 }
