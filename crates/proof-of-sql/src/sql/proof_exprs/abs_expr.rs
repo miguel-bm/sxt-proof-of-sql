@@ -92,32 +92,29 @@ impl ProofExpr for AbsExpr {
         // Allocate expr_scalars in bump allocator so it lives for 'a
         let expr_scalars = alloc.alloc_slice_copy(&expr_column.to_scalar());
 
-        // Get sign bits (true if negative) and produce the necessary proof components
+        // Get sign bits (true if negative) and produce the necessary proof components.
         // The sign gadget commits bit decomposition MLEs and proves they are binary.
-        // IMPORTANT: We do NOT commit sign_scalars as a separate MLE.
-        // The verifier derives sign_eval from the sign gadget's committed bits:
-        //   sign_eval = chi_eval - chi_minus_sign_eval
-        // This ensures the sign used in our constraint is cryptographically linked
-        // to the sign gadget's verified output.
         let signs = final_round_evaluate_sign(builder, alloc, expr_scalars);
 
-        // Convert signs to scalars for use in the sumcheck polynomial
+        // Convert signs to scalars for use in the sumcheck polynomial.
+        // We commit this as an intermediate MLE so the sumcheck can use it.
+        // SECURITY: The verifier will check that this committed sign_scalars evaluation
+        // matches the sign_eval derived from the sign gadget's bit decomposition,
+        // preventing the prover from using arbitrary sign values.
         let sign_scalars: &[S] =
             alloc
                 .alloc_slice_fill_iter(signs.iter().map(|&b| if b { S::one() } else { S::zero() }));
+        builder.produce_intermediate_mle(sign_scalars as &[_]);
 
         // Compute abs: if sign is negative, negate the value
         let result = compute_abs(alloc, expr_scalars, signs);
 
-        // Commit only the result MLE
+        // Commit the result MLE
         builder.produce_intermediate_mle(result as &[_]);
 
         // Prove the constraint: result = expr * (1 - 2*sign)
         // Rearranged: result - expr + 2*expr*sign = 0
         // This ensures result = expr when sign=0, and result = -expr when sign=1
-        //
-        // Note: sign_scalars is NOT committed separately. The verifier computes
-        // sign_eval from the sign gadget's output, ensuring cryptographic linkage.
         builder.produce_sumcheck_subpolynomial(
             SumcheckSubpolynomialType::Identity,
             vec![
@@ -149,15 +146,27 @@ impl ProofExpr for AbsExpr {
             .expr
             .verifier_evaluate(builder, accessor, chi_eval, params)?;
 
-        // Verify the sign gadget's bit decomposition constraints
-        // This consumes the sign gadget's bit MLEs and verifies they are binary
+        // Verify the sign gadget's bit decomposition constraints.
+        // This consumes the sign gadget's bit MLEs and verifies they are binary.
+        // Returns chi_eval - sign_eval where sign_eval is the leading bit MLE evaluation.
         let chi_minus_sign_eval = verifier_evaluate_sign(builder, expr_eval, chi_eval, None)?;
 
-        // SECURITY: Derive sign_eval from the sign gadget's verified output.
-        // This ensures the sign used in our constraint is cryptographically linked
-        // to the sign gadget's bit decomposition, preventing a malicious prover
-        // from using arbitrary sign values.
-        let sign_eval = chi_eval - chi_minus_sign_eval;
+        // Compute the expected sign evaluation from the sign gadget's verified output
+        let sign_eval_from_gadget = chi_eval - chi_minus_sign_eval;
+
+        // Consume the committed sign_scalars MLE evaluation
+        let sign_scalars_eval = builder.try_consume_final_round_mle_evaluation()?;
+
+        // SECURITY: Verify that the committed sign_scalars matches the sign derived
+        // from the bit decomposition. This prevents a malicious prover from committing
+        // arbitrary sign values that don't correspond to the actual signs of the data.
+        // Since both are MLE evaluations at the same random point, equality of evaluations
+        // implies equality of the underlying polynomials (with high probability).
+        if sign_scalars_eval != sign_eval_from_gadget {
+            return Err(ProofError::VerificationError {
+                error: "sign_scalars does not match sign from bit decomposition",
+            });
+        }
 
         // Consume the result MLE evaluation
         let result_eval = builder.try_consume_final_round_mle_evaluation()?;
@@ -165,7 +174,7 @@ impl ProofExpr for AbsExpr {
         // Verify the constraint: result - expr + 2*expr*sign = 0
         builder.try_produce_sumcheck_subpolynomial_evaluation(
             SumcheckSubpolynomialType::Identity,
-            result_eval - expr_eval + S::TWO * expr_eval * sign_eval,
+            result_eval - expr_eval + S::TWO * expr_eval * sign_scalars_eval,
             2,
         )?;
 
