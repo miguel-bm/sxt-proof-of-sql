@@ -260,7 +260,21 @@ pub fn verifier_evaluate_sign_with_column<S: Scalar>(
 
     // SECURITY: Verify the committed sign column matches the sign from bit decomposition.
     // This prevents a malicious prover from committing arbitrary sign values.
-    if sign_column_eval != sign_eval_from_bits {
+    //
+    // When sign bit varies: sign_column_eval should equal lead_bit (both are MLE evaluations)
+    // When sign bit is constant: sign_eval_from_bits = constant * chi_eval, but
+    //   sign_column_eval is just the constant (0 or 1). So we verify:
+    //   sign_column_eval * chi_eval == sign_eval_from_bits
+    let sign_matches = if lead_bit.is_some() {
+        // Sign varies: direct comparison of MLE evaluations
+        sign_column_eval == sign_eval_from_bits
+    } else {
+        // Sign is constant: sign_eval_from_bits is scaled by chi_eval
+        // sign_column_eval (0 or 1) * chi_eval should equal sign_eval_from_bits
+        sign_column_eval * chi_eval == sign_eval_from_bits
+    };
+
+    if !sign_matches {
         return Err(ProofError::VerificationError {
             error: "sign column does not match sign from bit decomposition",
         });
