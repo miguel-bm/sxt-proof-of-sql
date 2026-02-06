@@ -321,7 +321,10 @@ mod tests {
         let res = VerifiableQueryResult::new(&expr, &accessor, &(), &[]).unwrap();
         exercise_verification(&res, &expr, &accessor, &t);
         let res = res.verify(&expr, &accessor, &(), &[]).unwrap().table;
-        let expected = owned_table([int128("abs_a", [1_000_000_000_000_i128, 0, 1_000_000_000_000])]);
+        let expected = owned_table([int128(
+            "abs_a",
+            [1_000_000_000_000_i128, 0, 1_000_000_000_000],
+        )]);
         assert_eq!(res, expected);
     }
 
