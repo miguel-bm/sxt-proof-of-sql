@@ -8,7 +8,7 @@ use crate::{
         scalar::Scalar,
     },
     sql::{
-        proof::{FinalRoundBuilder, VerificationBuilder},
+        proof::{FinalRoundBuilder, SumcheckSubpolynomialType, VerificationBuilder},
         proof_gadgets::{
             final_round_evaluate_sign, first_round_evaluate_sign, verifier_evaluate_sign,
         },
@@ -16,7 +16,7 @@ use crate::{
     },
     utils::log,
 };
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 use bumpalo::Bump;
 #[cfg(feature = "rayon")]
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
@@ -93,14 +93,38 @@ impl ProofExpr for AbsExpr {
         let expr_scalars = alloc.alloc_slice_copy(&expr_column.to_scalar());
 
         // Get sign bits (true if negative) and produce the necessary proof components
+        // The sign gadget commits bit decomposition MLEs and proves they are binary
         let signs = final_round_evaluate_sign(builder, alloc, expr_scalars);
+
+        // Convert signs to scalars for use in the constraint
+        let sign_scalars: &[S] =
+            alloc
+                .alloc_slice_fill_iter(signs.iter().map(|&b| if b { S::one() } else { S::zero() }));
 
         // Compute abs: if sign is negative, negate the value
         let result = compute_abs(alloc, expr_scalars, signs);
 
-        // Produce intermediate MLE for the result
-        // FilterExec needs this for column commitments
+        // Produce intermediate MLEs: sign_scalars first (to match verifier consumption order), then result
+        builder.produce_intermediate_mle(sign_scalars as &[_]);
         builder.produce_intermediate_mle(result as &[_]);
+
+        // Prove the constraint: result = expr * (1 - 2*sign)
+        // Rearranged: result - expr + 2*expr*sign = 0
+        // This ensures result = expr when sign=0, and result = -expr when sign=1
+        builder.produce_sumcheck_subpolynomial(
+            SumcheckSubpolynomialType::Identity,
+            vec![
+                (S::one(), vec![Box::new(result as &[_])]),
+                (-S::one(), vec![Box::new(expr_scalars as &[_])]),
+                (
+                    S::TWO,
+                    vec![
+                        Box::new(expr_scalars as &[_]),
+                        Box::new(sign_scalars as &[_]),
+                    ],
+                ),
+            ],
+        );
 
         log::log_memory_usage("End");
 
@@ -118,13 +142,22 @@ impl ProofExpr for AbsExpr {
             .expr
             .verifier_evaluate(builder, accessor, chi_eval, params)?;
 
-        // Get the sign evaluation from the sign gadget
-        // verifier_evaluate_sign returns chi_eval - sign_eval when successful
-        // This consumes the sign gadget's MLEs and constraints
+        // Verify the sign gadget's bit decomposition constraints
+        // This consumes the sign gadget's bit MLEs and verifies they are binary
         let _chi_minus_sign_eval = verifier_evaluate_sign(builder, expr_eval, chi_eval, None)?;
+
+        // Consume the sign MLE evaluation (we committed this for the constraint)
+        let sign_eval = builder.try_consume_final_round_mle_evaluation()?;
 
         // Consume the result MLE evaluation
         let result_eval = builder.try_consume_final_round_mle_evaluation()?;
+
+        // Verify the constraint: result - expr + 2*expr*sign = 0
+        builder.try_produce_sumcheck_subpolynomial_evaluation(
+            SumcheckSubpolynomialType::Identity,
+            result_eval - expr_eval + S::TWO * expr_eval * sign_eval,
+            2,
+        )?;
 
         Ok(result_eval)
     }
